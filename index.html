@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gestione Contratti di Locazione v1.0.0</title>
+<title>Gestione Contratti di Locazione v1.1.0</title>
 <meta name="description" content="Gestione contratti di locazione: archivio SQLite, import automatico da cartella con OCR, scadenzario e rinnovi.">
 <!-- sql.js: SQLite compilato in WebAssembly. Le altre librerie (pdf.js, mammoth, tesseract) sono caricate solo quando servono. -->
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
@@ -194,7 +194,7 @@ const Modules = (() => {
    --------------------------------------------------------------------- */
 Modules.define('Config', [], () => Object.freeze({
   APP_NAME: 'Gestione Contratti di Locazione',
-  APP_VERSION: '1.0.0',
+  APP_VERSION: '1.1.0',
   IDB_NAME: 'contratti-locazione',
   LOG_KEY: 'cl.registroErrori',
   LOG_MAX: 1000,
@@ -333,7 +333,9 @@ Modules.define('Util', [], () => {
     setTimeout(() => URL.revokeObjectURL(url), 2000);
   }
   async function copyText(text) {
-    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return; }
+    if (navigator.clipboard && window.isSecureContext) {
+      try { await navigator.clipboard.writeText(text); return; } catch (e) { /* bloccato (es. iframe del sito): uso il metodo classico */ }
+    }
     const ta = document.createElement('textarea');
     ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
     document.body.appendChild(ta); ta.select();
@@ -395,12 +397,35 @@ Modules.define('Util', [], () => {
 });
 
 /* ---------------------------------------------------------------------
+   Ambiente — cosa consente il contesto in cui gira la pagina.
+   Dentro un iframe "sandbox" senza allow-same-origin (es. area applicativi
+   del sito) l'origine è opaca: niente IndexedDB/localStorage e niente
+   selettori di file o cartelle con scrittura (File System Access API).
+   --------------------------------------------------------------------- */
+Modules.define('Ambiente', [], () => {
+  const sandboxed = self.origin === 'null';
+  let incorniciata = false;
+  try { incorniciata = window.top !== window.self; } catch (e) { incorniciata = true; }
+  return Object.freeze({
+    sandboxed,
+    incorniciata,
+    /** Scrittura diretta di file e cartelle: Chrome/Edge, pagina non isolata e non incorniciata da un altro sito. */
+    fileAccess: !sandboxed && typeof window.showOpenFilePicker === 'function',
+    dirAccess: !sandboxed && typeof window.showDirectoryPicker === 'function'
+  });
+});
+
+/* ---------------------------------------------------------------------
    Store — piccolo archivio chiave/valore su IndexedDB.
    Conserva la copia di lavoro del database e gli "handle" di file e
    cartelle (Chrome/Edge permettono di salvarli e riaprirli).
+   Se IndexedDB non è disponibile (sandbox, navigazione privata) usa la
+   memoria: available() lo segnala e Db passa alla modalità 'memoria'.
    --------------------------------------------------------------------- */
 Modules.define('Store', ['Config'], (Config) => {
   let dbPromise = null;
+  const memory = new Map();
+  let useMemory = false;
   function open() {
     if (!dbPromise) {
       dbPromise = new Promise((resolve, reject) => {
@@ -412,7 +437,15 @@ Modules.define('Store', ['Config'], (Config) => {
     }
     return dbPromise;
   }
+  /** true se i dati sopravvivono alla chiusura della pagina. */
+  async function available() {
+    try { await open(); return true; } catch (e) { useMemory = true; return false; }
+  }
   function tx(mode, op) {
+    if (useMemory) {
+      const fake = { get: (k) => ({ result: memory.get(k) }), put: (v, k) => { memory.set(k, v); return {}; }, delete: (k) => { memory.delete(k); return {}; } };
+      return Promise.resolve(op(fake)).then(r => r && r.result);
+    }
     return open().then(db => new Promise((resolve, reject) => {
       const t = db.transaction('kv', mode);
       const req = op(t.objectStore('kv'));
@@ -422,6 +455,7 @@ Modules.define('Store', ['Config'], (Config) => {
     }));
   }
   return {
+    available,
     get: (key) => tx('readonly', s => s.get(key)),
     set: (key, value) => tx('readwrite', s => s.put(value, key)),
     del: (key) => tx('readwrite', s => s.delete(key))
@@ -618,23 +652,33 @@ Modules.define('Migrations', [], () => {
    Db — database SQLite (sql.js) in memoria + persistenza.
    Modalità:
      'locale'     copia nel browser (IndexedDB) della singola postazione;
-     'condiviso'  file .sqlite su cartella del server, letto/scritto con la
-                  File System Access API (Chrome/Edge). Prima di ogni
-                  scrittura il file viene ricaricato se un collega l'ha
-                  modificato, poi viene riscritto subito: la finestra di
-                  conflitto si riduce a pochi millisecondi.
+     'condiviso'  file .sqlite in una cartella del server scelta
+                  dall'utente, letto/scritto con la File System Access API
+                  (Chrome/Edge). Prima di ogni scrittura il file viene
+                  ricaricato se un collega l'ha modificato, poi viene
+                  riscritto subito: la finestra di conflitto si riduce a
+                  pochi millisecondi. Una volta al giorno ne viene salvata
+                  una copia nella sottocartella "backup".
      'attesa'     esiste un archivio condiviso ma il browser chiede di
                   riconfermare il permesso: si consulta la copia locale in
                   sola lettura finché l'utente non ricollega.
+     'memoria'    il browser non consente di conservare dati (es. app
+                  allegata al sito, che gira in sandbox): l'archivio si apre
+                  da file e si salva scaricandolo.
    --------------------------------------------------------------------- */
-Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations'], (Config, Log, Store, Migrations) => {
+Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations', 'Ambiente'], (Config, Log, Store, Migrations, Ambiente) => {
+  const NOME_ARCHIVIO = 'contratti-locazione.sqlite';
+  const CARTELLA_BACKUP = 'backup';
+  const BACKUP_DA_TENERE = 30;
   let SQL = null;
   let db = null;
-  const state = { mode: 'locale', fileHandle: null, fileName: '', lastModified: null, lastSync: null, schema: null };
+  const state = { mode: 'locale', fileHandle: null, dirHandle: null, fileName: '', folderName: '', lastModified: null, lastSync: null, schema: null, dirty: false, backupDay: null };
   const listeners = new Set();
   let writeChain = Promise.resolve();
 
-  const supportsFileAccess = () => typeof window.showOpenFilePicker === 'function';
+  const supportsFileAccess = () => Ambiente.fileAccess;
+  const supportsFolder = () => Ambiente.dirAccess;
+  const oggi = () => new Date().toISOString().slice(0, 10);
   function notify(reason) { listeners.forEach(fn => { try { fn(reason); } catch (e) { Log.fromError('Db', e, 'listener'); } }); }
   function clean(params) { return (params || []).map(v => v === undefined ? null : (typeof v === 'boolean' ? (v ? 1 : 0) : v)); }
 
@@ -659,12 +703,11 @@ Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations'], (Config, Log, Sto
     if (!bytes || info.applied.length) await Store.set('db.bytes', exportBytes());
     return { isNew: !bytes };
   }
-  async function loadFromHandle(handle) {
+  async function loadFromHandle(handle, dirHandle) {
     const file = await handle.getFile();
     const bytes = file.size ? new Uint8Array(await file.arrayBuffer()) : null;
     const info = openBytes(bytes);
-    state.mode = 'condiviso'; state.fileHandle = handle; state.fileName = handle.name;
-    state.lastModified = file.lastModified; state.lastSync = new Date();
+    Object.assign(state, { mode: 'condiviso', fileHandle: handle, dirHandle: dirHandle || null, fileName: handle.name, folderName: dirHandle ? dirHandle.name : '', lastModified: file.lastModified, lastSync: new Date() });
     if (!bytes || info.applied.length) await writeToHandle(); // file nuovo o schema aggiornato: lo riscriviamo subito
     await Store.set('db.bytes', exportBytes());
   }
@@ -675,8 +718,33 @@ Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations'], (Config, Log, Sto
     await w.close();
     const f = await state.fileHandle.getFile();
     state.lastModified = f.lastModified; state.lastSync = new Date();
+    await backupGiornaliero(bytes);
+  }
+  /** Prima scrittura del giorno: copia in <cartella>/backup/ e conserva solo gli ultimi BACKUP_DA_TENERE. */
+  async function backupGiornaliero(bytes) {
+    if (!state.dirHandle || state.backupDay === oggi()) return;
+    try {
+      const dir = await state.dirHandle.getDirectoryHandle(CARTELLA_BACKUP, { create: true });
+      const nome = state.fileName.replace(/\.[^.]+$/, '') + '_' + oggi() + '.sqlite';
+      let esiste = true;
+      try { await dir.getFileHandle(nome); } catch (e) { esiste = false; }
+      if (!esiste) {
+        const w = await (await dir.getFileHandle(nome, { create: true })).createWritable();
+        await w.write(bytes); await w.close();
+        const copie = [];
+        for await (const [n, h] of dir.entries()) if (h.kind === 'file' && /_\d{4}-\d{2}-\d{2}\.sqlite$/.test(n)) copie.push(n);
+        copie.sort();
+        for (const vecchio of copie.slice(0, Math.max(0, copie.length - BACKUP_DA_TENERE))) await dir.removeEntry(vecchio);
+        Log.info('Db', `Backup giornaliero ${CARTELLA_BACKUP}/${nome}`);
+      }
+      state.backupDay = oggi();
+    } catch (e) {
+      state.backupDay = oggi(); // un backup fallito non deve bloccare i salvataggi né ripetersi a ogni scrittura
+      Log.fromError('Db', e, 'Backup giornaliero');
+    }
   }
   async function persist() {
+    if (state.mode === 'memoria') { state.dirty = true; notify('salvato'); return; }
     if (state.mode === 'condiviso') await writeToHandle();
     await Store.set('db.bytes', exportBytes());
     notify('salvato');
@@ -695,13 +763,20 @@ Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations'], (Config, Log, Sto
 
   async function start() {
     SQL = await window.initSqlJs({ locateFile: (f) => Config.CDN.sqlWasmDir + f });
+    if (!(await Store.available())) {
+      openBytes(null);
+      state.mode = 'memoria';
+      Log.info('Db', Ambiente.sandboxed ? 'Pagina in sandbox (es. allegata al sito): archivio in memoria, da aprire e salvare come file' : 'IndexedDB non disponibile: archivio in memoria');
+      return { isNew: true };
+    }
+    const dirHandle = supportsFolder() ? await Store.get('db.dirHandle') : null;
     const handle = supportsFileAccess() ? await Store.get('db.fileHandle') : null;
     if (handle) {
-      state.fileHandle = handle; state.fileName = handle.name;
+      Object.assign(state, { fileHandle: handle, dirHandle: dirHandle || null, fileName: handle.name, folderName: dirHandle ? dirHandle.name : '' });
       let perm = 'prompt';
-      try { perm = await handle.queryPermission({ mode: 'readwrite' }); } catch (e) { Log.fromError('Db', e, 'Verifica permesso archivio'); }
+      try { perm = await (dirHandle || handle).queryPermission({ mode: 'readwrite' }); } catch (e) { Log.fromError('Db', e, 'Verifica permesso archivio'); }
       if (perm === 'granted') {
-        try { await loadFromHandle(handle); return { isNew: false }; }
+        try { await loadFromHandle(handle, dirHandle); return { isNew: false }; }
         catch (e) { Log.fromError('Db', e, 'Apertura archivio condiviso ' + handle.name); }
       }
       await loadLocal();
@@ -754,53 +829,95 @@ Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations'], (Config, Log, Sto
   }
 
   /* --- gestione archivio --- */
+  async function ensurePermission(handle) {
+    if ((await handle.queryPermission({ mode: 'readwrite' })) === 'granted') return;
+    if ((await handle.requestPermission({ mode: 'readwrite' })) !== 'granted') throw new Error('Permesso di scrittura negato');
+  }
+  async function memorizza() {
+    await Store.set('db.fileHandle', state.fileHandle);
+    if (state.dirHandle) await Store.set('db.dirHandle', state.dirHandle); else await Store.del('db.dirHandle');
+  }
+  /**
+   * Fa scegliere la cartella del server in cui tenere l'archivio (va chiamata da un click).
+   * Restituisce la cartella e se contiene già un archivio (contratti-locazione.sqlite).
+   */
+  async function pickFolder() {
+    const dirHandle = await window.showDirectoryPicker({ id: 'archivio-contratti', mode: 'readwrite' });
+    await ensurePermission(dirHandle);
+    let esistente = null;
+    try { esistente = await dirHandle.getFileHandle(NOME_ARCHIVIO); } catch (e) { if (e.name !== 'NotFoundError' && e.name !== 'TypeMismatchError') throw e; }
+    return { dirHandle, esiste: !!esistente, nomeFile: NOME_ARCHIVIO };
+  }
+  /**
+   * Collega la cartella scelta: se l'archivio esiste lo apre (i dati locali vengono sostituiti),
+   * altrimenti lo crea con i dati attuali.
+   */
+  async function useFolder(dirHandle) {
+    await writeChain;
+    let handle = null;
+    try { handle = await dirHandle.getFileHandle(NOME_ARCHIVIO); } catch (e) { handle = null; }
+    if (handle) {
+      await loadFromHandle(handle, dirHandle);
+      Log.info('Db', `Aperto archivio ${NOME_ARCHIVIO} nella cartella ${dirHandle.name}`);
+    } else {
+      handle = await dirHandle.getFileHandle(NOME_ARCHIVIO, { create: true });
+      Object.assign(state, { mode: 'condiviso', fileHandle: handle, dirHandle, fileName: handle.name, folderName: dirHandle.name, backupDay: null });
+      await writeToHandle();
+      await Store.set('db.bytes', exportBytes());
+      Log.info('Db', `Creato archivio ${NOME_ARCHIVIO} nella cartella ${dirHandle.name}`);
+    }
+    await memorizza();
+    notify('archivio');
+  }
+  /** Alternativa: collega un file .sqlite specifico (anche con un nome diverso). Senza cartella non si fanno backup. */
   async function connectShared() {
     const [handle] = await window.showOpenFilePicker({
       types: [{ description: 'Database SQLite', accept: { 'application/x-sqlite3': ['.sqlite', '.db', '.sqlite3'] } }],
       excludeAcceptAllOption: false, multiple: false
     });
-    if ((await handle.requestPermission({ mode: 'readwrite' })) !== 'granted') throw new Error('Permesso di scrittura negato');
+    await ensurePermission(handle);
     await writeChain;
-    await loadFromHandle(handle);
-    await Store.set('db.fileHandle', handle);
+    await loadFromHandle(handle, null);
+    await memorizza();
     Log.info('Db', 'Collegato archivio condiviso ' + handle.name);
     notify('archivio');
   }
-  /** Crea un nuovo file .sqlite (es. sulla cartella del server) copiandovi i dati attuali. */
-  async function createShared() {
-    const handle = await window.showSaveFilePicker({
-      suggestedName: 'contratti-locazione.sqlite',
-      types: [{ description: 'Database SQLite', accept: { 'application/x-sqlite3': ['.sqlite'] } }]
-    });
-    await writeChain;
-    state.mode = 'condiviso'; state.fileHandle = handle; state.fileName = handle.name;
-    await writeToHandle();
-    await Store.set('db.fileHandle', handle);
-    Log.info('Db', 'Creato archivio condiviso ' + handle.name);
-    notify('archivio');
-  }
   async function reconnect() {
-    const handle = state.fileHandle;
-    if (!handle) throw new Error('Nessun archivio condiviso memorizzato');
-    if ((await handle.requestPermission({ mode: 'readwrite' })) !== 'granted') throw new Error('Permesso negato');
-    await loadFromHandle(handle);
+    if (!state.fileHandle) throw new Error('Nessun archivio condiviso memorizzato');
+    await ensurePermission(state.dirHandle || state.fileHandle);
+    await loadFromHandle(state.fileHandle, state.dirHandle);
     notify('archivio');
   }
   async function disconnect() {
     await writeChain;
     await Store.del('db.fileHandle');
-    state.mode = 'locale'; state.fileHandle = null; state.fileName = ''; state.lastModified = null;
+    await Store.del('db.dirHandle');
+    Object.assign(state, { mode: 'locale', fileHandle: null, dirHandle: null, fileName: '', folderName: '', lastModified: null });
     await Store.set('db.bytes', exportBytes());
     Log.info('Db', 'Archivio condiviso scollegato: si lavora sulla copia locale');
     notify('archivio');
   }
-  /** Sostituisce il database corrente con un file .sqlite (usato anche come fallback su Firefox/Safari). */
-  async function replaceWithBytes(bytes) {
+  /** Sostituisce il database corrente con un file .sqlite (usato anche in modalità memoria e su Firefox/Safari). */
+  async function replaceWithBytes(bytes, fileName) {
     await writeChain;
     if (state.mode === 'attesa') throw new Error('Ricollega prima l\'archivio condiviso');
     openBytes(new Uint8Array(bytes));
+    if (state.mode === 'memoria') { state.fileName = fileName || state.fileName; state.dirty = false; notify('archivio'); return; }
     await persist();
     notify('archivio');
+  }
+  /** Modalità memoria: scarica l'archivio con lo stesso nome con cui è stato aperto. */
+  function saveDownload() {
+    const name = state.fileName || NOME_ARCHIVIO;
+    const blob = new Blob([exportBytes()], { type: 'application/x-sqlite3' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    state.dirty = false;
+    notify('salvato');
+    return name;
   }
   async function resetEmpty() {
     await writeChain;
@@ -811,8 +928,8 @@ Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations'], (Config, Log, Sto
   }
 
   return {
-    start, all, one, run, write, poll, exportBytes, connectShared, createShared, reconnect, disconnect, replaceWithBytes, resetEmpty,
-    supportsFileAccess, state: () => ({ ...state }),
+    start, all, one, run, write, poll, exportBytes, pickFolder, useFolder, connectShared, reconnect, disconnect, replaceWithBytes, saveDownload, resetEmpty,
+    supportsFileAccess, supportsFolder, NOME_ARCHIVIO, state: () => ({ ...state }),
     onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     tableColumns: (table) => all(`PRAGMA table_info(${table})`).map(r => r.name)
   };
@@ -1861,10 +1978,10 @@ Modules.define('Parser', ['Util', 'Dominio'], (Util, Dominio) => {
      può "ricontrollare" per trovare i nuovi file.
    - Firefox/Safari: input con attributo webkitdirectory (sola lettura).
    --------------------------------------------------------------------- */
-Modules.define('FolderImport', ['Extract', 'Parser', 'Repo', 'Store', 'Prefs', 'Util', 'Log'], (Extract, Parser, Repo, Store, Prefs, Util, Log) => {
+Modules.define('FolderImport', ['Extract', 'Parser', 'Repo', 'Store', 'Prefs', 'Util', 'Log', 'Ambiente'], (Extract, Parser, Repo, Store, Prefs, Util, Log, Ambiente) => {
   const sessionFiles = new Map(); // percorso → File, per riaprire l'originale durante la sessione
   let cancelled = false;
-  const supportsPicker = () => typeof window.showDirectoryPicker === 'function';
+  const supportsPicker = () => Ambiente.dirAccess;
 
   async function walk(dirHandle, prefix, out) {
     for await (const [name, handle] of dirHandle.entries()) {
@@ -2145,18 +2262,26 @@ Modules.define('UI', ['Util', 'Log'], (Util, Log) => {
   }
   const modalEl = () => document.getElementById('modal');
   let onModalClose = null;
+  const closedListeners = new Set();
+  /** Chiusura della finestra: callback della finestra corrente + ascoltatori globali. Chiamata sia da closeModal
+      sia dall'evento nativo (tasto Esc), perché l'evento "close" non arriva sempre (es. scheda in background). */
+  function runClose() {
+    const cb = onModalClose; onModalClose = null;
+    if (cb) cb();
+    closedListeners.forEach(fn => fn());
+  }
   function openModal({ title, body, footer, onMount, onClose }) {
     const m = modalEl();
     m.innerHTML = str(html`<div class="modal-head"><h2>${title}</h2><button class="btn small" data-close aria-label="Chiudi">✕</button></div><div class="modal-body">${body}</div>${footer ? html`<div class="modal-foot">${footer}</div>` : ''}`);
     m.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => closeModal()));
     onModalClose = onClose || null;
-    m.onclose = () => { const cb = onModalClose; onModalClose = null; if (cb) cb(); };
+    m.onclose = () => { if (onModalClose || closedListeners.size) runClose(); };
     if (!m.open) m.showModal();
     m.scrollTop = 0;
     if (onMount) { try { onMount(m); } catch (e) { Log.fromError('UI', e, 'Apertura finestra'); toast(e.message, 'danger'); } }
     return m;
   }
-  function closeModal() { const m = modalEl(); if (m.open) m.close(); }
+  function closeModal() { const m = modalEl(); if (!m.open) return; m.close(); runClose(); }
   const isModalOpen = () => modalEl().open;
   /** Conferma asincrona; se una modale è già aperta usa window.confirm per non perderne il contenuto. */
   function confirmDialog(message, { ok = 'Conferma', danger = false } = {}) {
@@ -2200,7 +2325,7 @@ Modules.define('UI', ['Util', 'Log'], (Util, Log) => {
       input.click();
     });
   }
-  return { html, raw, str, options, toast, openModal, closeModal, isModalOpen, confirmDialog, guard, readForm, pickFile };
+  return { html, raw, str, options, toast, openModal, closeModal, isModalOpen, confirmDialog, guard, readForm, pickFile, onModalClosed: (fn) => closedListeners.add(fn) };
 });
 
 /* ---------------------------------------------------------------------
@@ -2614,8 +2739,8 @@ Modules.define('ContrattoDettaglio', ['UI', 'Repo', 'Rinnovi', 'Dominio', 'Util'
 /* =====================================================================
    VISTE — ogni vista espone render(el, ctx). ctx = { refresh, navigate }.
    ===================================================================== */
-Modules.define('DashboardView', ['UI', 'Repo', 'Scadenzario', 'ScadenzeTable', 'ScadenzaForm', 'ContrattoDettaglio', 'Util', 'Db', 'Prefs'],
-  (UI, Repo, Scadenzario, ScadenzeTable, ScadenzaForm, ContrattoDettaglio, Util, Db, Prefs) => {
+Modules.define('DashboardView', ['UI', 'Repo', 'Scadenzario', 'ScadenzeTable', 'ScadenzaForm', 'ContrattoDettaglio', 'Util', 'Db', 'Prefs', 'Archivio'],
+  (UI, Repo, Scadenzario, ScadenzeTable, ScadenzaForm, ContrattoDettaglio, Util, Db, Prefs, Archivio) => {
   const { html } = UI;
   function render(el, ctx) {
     const s = Repo.statistiche();
@@ -2626,7 +2751,9 @@ Modules.define('DashboardView', ['UI', 'Repo', 'Scadenzario', 'ScadenzeTable', '
     const kpi = (v, l, cls, href) => html`<a class="card" href="${href}" style="text-decoration:none;color:inherit"><div class="value" style="${cls ? 'color:var(--' + cls + ')' : ''}">${v}</div><div class="label">${l}</div></a>`;
     el.innerHTML = UI.str(html`
       <h1>Riepilogo</h1>
-      ${st.mode === 'locale' ? html`<div class="alert warn">Stai lavorando sulla copia locale di questo browser: i colleghi non vedono questi dati. Per l'uso in ufficio collega il file condiviso sul server in <a href="#/impostazioni">Impostazioni</a>.</div>` : ''}
+      ${st.mode === 'locale' ? html`<div class="card"><div class="alert warn">Stai lavorando sulla copia locale di questo browser: i colleghi non vedono questi dati. Per l'uso in ufficio scegli la cartella del server in cui tenere l'archivio.</div>${Archivio.azioniHtml({ completo: false })}</div>` : ''}
+      ${st.mode === 'attesa' ? html`<div class="card"><div class="alert danger">Il browser chiede di riconfermare l'accesso all'archivio sul server. Finché non ricolleghi i dati sono in sola lettura.</div>${Archivio.azioniHtml({ completo: false })}</div>` : ''}
+      ${st.mode === 'memoria' ? html`<div class="card">${Archivio.statoHtml()}<p class="muted">L'app gira all'interno del sito, dove il browser non le consente di salvare nelle cartelle: apri <strong>${Db.NOME_ARCHIVIO}</strong> dalla cartella del server e, dopo le modifiche, salvalo e rimettilo al suo posto.</p>${Archivio.azioniHtml({ completo: false })}</div>` : ''}
       ${!Prefs.get('utente') ? html`<div class="alert info">Indica il tuo nome in <a href="#/impostazioni">Impostazioni</a>: verrà registrato su modifiche e adempimenti completati.</div>` : ''}
       <div class="grid kpi">
         ${kpi(s.attivi, 'Contratti attivi', '', '#/contratti')}
@@ -2639,6 +2766,7 @@ Modules.define('DashboardView', ['UI', 'Repo', 'Scadenzario', 'ScadenzeTable', '
       <h2>Adempimenti scaduti e in arrivo</h2>
       <div id="dash-scad">${ScadenzeTable.render(rows, { emptyText: 'Nessun adempimento scaduto o in arrivo' })}</div>`);
     ScadenzeTable.bind(el.querySelector('#dash-scad'), rows, { refresh: ctx.refresh, openContratto: (id) => ContrattoDettaglio.open(id, ctx), editScadenza: (r) => ScadenzaForm.open(r, ctx.refresh) });
+    Archivio.bind(el, ctx);
   }
   return { title: 'Riepilogo', render };
 });
@@ -2918,12 +3046,98 @@ Modules.define('DatiView', ['UI', 'ImportExport', 'Db', 'Util', 'Log'], (UI, Imp
   return { title: 'Import / Export', render };
 });
 
-Modules.define('ImpostazioniView', ['UI', 'Db', 'Prefs', 'Seed', 'Migrations', 'Config', 'Util', 'Log'], (UI, Db, Prefs, Seed, Migrations, Config, Util, Log) => {
+/* ---------------------------------------------------------------------
+   Archivio — stato e azioni sull'archivio (scelta della cartella del
+   server, ricollegamento, apertura/salvataggio come file nella modalità
+   memoria). Usato da Impostazioni e dal Riepilogo.
+   --------------------------------------------------------------------- */
+Modules.define('Archivio', ['UI', 'Db', 'Ambiente', 'Config'], (UI, Db, Ambiente, Config) => {
+  const { html } = UI;
+  const MODI = {
+    condiviso: ['ok', 'Archivio condiviso collegato'],
+    locale: ['warn', 'Copia locale del browser (solo questa postazione)'],
+    attesa: ['danger', 'Archivio condiviso in attesa di permesso'],
+    memoria: ['info', 'Archivio aperto in memoria: va salvato come file']
+  };
+  function statoHtml() {
+    const st = Db.state();
+    const m = MODI[st.mode];
+    return html`<p><span class="pill ${m[0]}">${m[1]}</span>
+      ${st.folderName ? html` cartella <strong>${st.folderName}</strong>,` : ''} ${st.fileName ? html` file <strong>${st.fileName}</strong>` : ''}
+      ${st.mode === 'memoria' && st.dirty ? html` <span class="tag warn">modifiche non salvate</span>` : ''}
+      ${st.lastSync ? html`<span class="muted">– ultima sincronizzazione ${st.lastSync.toLocaleTimeString('it-IT')}</span>` : ''}</p>`;
+  }
+  /** completo=true mostra anche spiegazioni e azioni secondarie (pagina Impostazioni). */
+  function azioniHtml({ completo }) {
+    const st = Db.state();
+    if (st.mode === 'memoria') {
+      const spiegazione = Ambiente.sandboxed
+        ? `L'app è aperta all'interno del sito: per sicurezza il browser non le permette di scrivere nelle cartelle del server né di conservare dati. Apri il file ${Db.NOME_ARCHIVIO} dalla cartella del server, lavora e poi salvalo: il browser lo scarica e va rimesso nella cartella, sostituendo il precedente. Per salvare direttamente sul server usa la versione autonoma dell'app (vedi README).`
+        : `Questo browser non permette di conservare i dati della pagina (es. navigazione privata): apri l'archivio da file e salvalo prima di chiudere.`;
+      return html`${completo ? html`<p class="muted">${spiegazione}</p>` : ''}
+        <div class="toolbar" style="margin-bottom:0">
+          <button class="btn primary" data-arch="apri-file">Apri archivio .sqlite…</button>
+          <button class="btn ${st.dirty ? 'primary' : ''}" data-arch="salva">Salva archivio (scarica ${st.fileName || Db.NOME_ARCHIVIO})</button>
+        </div>`;
+    }
+    if (!Db.supportsFolder()) {
+      return html`<div class="alert warn" style="margin-bottom:0">Questo browser non consente di scrivere direttamente nelle cartelle (funzione disponibile in Chrome ed Edge). Puoi lavorare su una copia locale, caricarla da <a href="#/dati">Import / Export</a> → "Carica da file .sqlite" e riscaricarla. Per l'uso condiviso in ufficio usa Chrome o Edge.</div>`;
+    }
+    return html`${completo ? html`<p class="muted">Scegli la cartella del server in cui tenere l'archivio (es. l'unità di rete <code>Z:\\Contratti</code>). Se la cartella contiene già <code>${Db.NOME_ARCHIVIO}</code> viene aperto, altrimenti viene creato con i dati attuali. Ogni postazione sceglie la stessa cartella una volta; l'app ricarica il file prima di ogni salvataggio, controlla le modifiche dei colleghi ogni ${Config.POLL_MS / 1000} secondi e ogni giorno salva una copia nella sottocartella <code>backup</code> (ultime 30).</p>` : ''}
+      <div class="toolbar" style="margin-bottom:0">
+        ${st.mode === 'attesa' ? html`<button class="btn primary" data-arch="ricollega">Ricollega ${st.folderName || st.fileName}</button>` : ''}
+        <button class="btn ${st.mode === 'condiviso' || st.mode === 'attesa' ? '' : 'primary'}" data-arch="cartella">${st.mode === 'condiviso' ? "Cambia cartella dell'archivio…" : 'Scegli la cartella del server…'}</button>
+        ${completo ? html`<button class="btn" data-arch="file">Apri un file .sqlite specifico…</button>` : ''}
+        ${completo && st.mode !== 'locale' ? html`<button class="btn danger" data-arch="scollega">Scollega (lavora in locale)</button>` : ''}
+      </div>`;
+  }
+  const AZIONI = {
+    'apri-file': async () => {
+      if (Db.state().dirty && !(await UI.confirmDialog('Ci sono modifiche non salvate: aprendo un altro archivio andranno perse. Continuare?', { ok: 'Apri comunque', danger: true }))) return;
+      const f = await UI.pickFile('.sqlite,.db,.sqlite3');
+      if (!f) return;
+      await Db.replaceWithBytes(await f.arrayBuffer(), f.name);
+      UI.toast('Archivio ' + f.name + ' aperto');
+    },
+    salva: async () => {
+      const n = Db.saveDownload();
+      UI.toast(`Archivio scaricato come ${n}: rimettilo nella cartella del server sostituendo il precedente`, 'ok', 9000);
+    },
+    ricollega: async () => { await Db.reconnect(); UI.toast('Archivio ricollegato'); },
+    cartella: async () => {
+      const scelta = await Db.pickFolder();
+      const locale = Db.state().mode === 'locale';
+      const n = (Db.one('SELECT COUNT(*) AS n FROM contratti') || { n: 0 }).n;
+      const msg = scelta.esiste
+        ? `La cartella "${scelta.dirHandle.name}" contiene già ${scelta.nomeFile}: verrà aperto e i dati visualizzati ora in questo browser saranno sostituiti da quelli del file.` + (locale ? '\nSe qui hai dati da conservare, esportali prima in JSON e poi importali con "aggiungi".' : '') + '\n\nProcedere?'
+        : `Nella cartella "${scelta.dirHandle.name}" verrà creato ${scelta.nomeFile} con i dati attuali (${n} contratti). Procedere?`;
+      if (!(await UI.confirmDialog(msg, { ok: scelta.esiste ? 'Apri archivio' : 'Crea archivio' }))) return;
+      await Db.useFolder(scelta.dirHandle);
+      UI.toast(scelta.esiste ? 'Archivio del server aperto' : 'Archivio creato nella cartella del server');
+    },
+    file: async () => {
+      if (!(await UI.confirmDialog('Aprendo un file, i dati visualizzati in questo browser saranno sostituiti da quelli del file. Senza cartella non vengono creati i backup giornalieri.\n\nProcedere?', { ok: 'Scegli file' }))) return;
+      await Db.connectShared();
+      UI.toast('Archivio condiviso collegato');
+    },
+    scollega: async () => {
+      if (!(await UI.confirmDialog("Scollegare l'archivio condiviso? Continuerai a lavorare su una copia locale che i colleghi non vedranno.", { ok: 'Scollega', danger: true }))) return;
+      await Db.disconnect();
+    }
+  };
+  function bind(el, ctx) {
+    el.querySelectorAll('[data-arch]').forEach(b => b.addEventListener('click', () => UI.guard('Archivio', b.textContent.trim(), async () => {
+      await AZIONI[b.dataset.arch]();
+      ctx.refresh();
+    })));
+  }
+  return { statoHtml, azioniHtml, bind };
+});
+
+Modules.define('ImpostazioniView', ['UI', 'Db', 'Prefs', 'Seed', 'Migrations', 'Config', 'Util', 'Log', 'Archivio'], (UI, Db, Prefs, Seed, Migrations, Config, Util, Log, Archivio) => {
   const { html, options } = UI;
   function render(el, ctx) {
     const st = Db.state();
-    const fs = Db.supportsFileAccess();
-    const modo = { condiviso: ['ok', 'Archivio condiviso collegato'], locale: ['warn', 'Copia locale del browser (solo questa postazione)'], attesa: ['danger', 'Archivio condiviso in attesa di permesso'] }[st.mode];
     el.innerHTML = UI.str(html`
       <h1>Impostazioni</h1>
       <div class="card">
@@ -2933,16 +3147,9 @@ Modules.define('ImpostazioniView', ['UI', 'Db', 'Prefs', 'Seed', 'Migrations', '
       </div>
       <div class="card">
         <h2 style="margin-top:0">Archivio dati</h2>
-        <p><span class="pill ${modo[0]}">${modo[1]}</span> ${st.fileName ? html` file <strong>${st.fileName}</strong>` : ''} ${st.lastSync ? html`<span class="muted">– ultima sincronizzazione ${st.lastSync.toLocaleTimeString('it-IT')}</span>` : ''}</p>
-        <p class="muted">Per lavorare in 5 sullo stesso archivio, il file <code>.sqlite</code> va messo in una cartella condivisa del server (es. unità di rete <code>Z:\\Contratti\\contratti-locazione.sqlite</code>). Ogni postazione lo collega una volta: l'app lo ricarica prima di ogni salvataggio e controlla le modifiche dei colleghi ogni ${Config.POLL_MS / 1000} secondi.</p>
-        ${fs ? html`<div class="toolbar">
-            ${st.mode === 'attesa' ? html`<button class="btn primary" id="db-reconnect">Ricollega ${st.fileName}</button>` : ''}
-            <button class="btn ${st.mode === 'condiviso' ? '' : 'primary'}" id="db-open">Apri archivio condiviso esistente…</button>
-            <button class="btn" id="db-create">Crea nuovo archivio condiviso con i dati attuali…</button>
-            ${st.mode !== 'locale' ? html`<button class="btn danger" id="db-disconnect">Scollega (lavora in locale)</button>` : ''}
-          </div>`
-        : html`<div class="alert warn">Questo browser non consente di scrivere direttamente su un file (File System Access API disponibile solo in Chrome ed Edge). Puoi consultare e modificare una copia locale, caricarla da <a href="#/dati">Import / Export</a> → "Carica da file .sqlite" e riscaricarla. Per l'uso condiviso in ufficio usa Chrome o Edge.</div>`}
-        <p class="muted" style="margin-bottom:0">Schema database: versione ${st.schema ? st.schema.to : '?'} (app: ${Migrations.latest()}). Una copia di lavoro resta sempre anche nel browser.</p>
+        ${Archivio.statoHtml()}
+        ${Archivio.azioniHtml({ completo: true })}
+        <p class="muted" style="margin-bottom:0">Schema database: versione ${st.schema ? st.schema.to : '?'} (app: ${Migrations.latest()}).${st.mode === 'memoria' ? '' : ' Una copia di lavoro resta sempre anche nel browser.'}</p>
       </div>
       <div class="card">
         <h2 style="margin-top:0">Preferenze</h2>
@@ -2968,16 +3175,7 @@ Modules.define('ImpostazioniView', ['UI', 'Db', 'Prefs', 'Seed', 'Migrations', '
     el.querySelector('#set-ocrpag').addEventListener('change', (e) => Prefs.set('ocrMaxPagine', Math.max(1, Math.min(50, Number(e.target.value) || 8))));
     el.querySelector('#set-tema').addEventListener('change', (e) => { Prefs.set('tema', e.target.value); ctx.applyTheme(); });
     const act = (id, label, fn) => { const b = el.querySelector(id); if (b) b.addEventListener('click', () => UI.guard('Impostazioni', label, async () => { await fn(); ctx.refresh(); })); };
-    act('#db-reconnect', 'Ricollegamento archivio', async () => { await Db.reconnect(); UI.toast('Archivio ricollegato'); });
-    act('#db-open', 'Apertura archivio condiviso', async () => {
-      if (!(await UI.confirmDialog('Aprendo un archivio condiviso, i dati della copia locale di questo browser saranno sostituiti da quelli del file. Se nella copia locale ci sono dati da conservare, usa invece "Crea nuovo archivio condiviso con i dati attuali" oppure esportali in JSON.\n\nProcedere?', { ok: 'Apri archivio' }))) return;
-      await Db.connectShared(); UI.toast('Archivio condiviso collegato');
-    });
-    act('#db-create', 'Creazione archivio condiviso', async () => { await Db.createShared(); UI.toast('Archivio condiviso creato'); });
-    act('#db-disconnect', 'Scollegamento archivio', async () => {
-      if (!(await UI.confirmDialog('Scollegare l\'archivio condiviso? Continuerai a lavorare su una copia locale che i colleghi non vedranno.', { ok: 'Scollega', danger: true }))) return;
-      await Db.disconnect();
-    });
+    Archivio.bind(el, ctx);
     act('#seed-load', 'Caricamento dati di esempio', async () => { await Seed.carica(); UI.toast('Dati di esempio caricati'); });
     act('#seed-del', 'Eliminazione dati di esempio', async () => { await Seed.rimuovi(); UI.toast('Dati di esempio eliminati'); });
     act('#db-reset', 'Svuotamento database', async () => {
@@ -3172,7 +3370,10 @@ Modules.define('App', ['Config', 'Log', 'Db', 'Seed', 'Prefs', 'UI', 'DashboardV
     const map = {
       condiviso: ['ok', `● Condiviso: ${st.fileName}${t}`, 'Archivio condiviso collegato'],
       locale: ['warn', '● Archivio locale (solo questo browser)', 'I dati non sono condivisi: collega il file del server in Impostazioni'],
-      attesa: ['danger', `● Ricollega ${st.fileName}`, 'Clicca per riconfermare l\'accesso al file condiviso']
+      attesa: ['danger', `● Ricollega ${st.folderName || st.fileName}`, 'Clicca per riconfermare l\'accesso al file condiviso'],
+      memoria: st.dirty
+        ? ['danger', `● ${st.fileName || 'Archivio'}: modifiche da salvare`, 'Salva l\'archivio (scarica il file) e rimettilo nella cartella del server']
+        : ['info', `● ${st.fileName ? 'Aperto: ' + st.fileName : 'Nessun archivio aperto'}`, 'Archivio in memoria: apri e salva il file da Impostazioni']
     }[st.mode];
     pill.className = 'pill ' + map[0]; pill.textContent = map[1]; pill.title = map[2];
     pill.style.cursor = 'pointer';
@@ -3205,9 +3406,11 @@ Modules.define('App', ['Config', 'Log', 'Db', 'Seed', 'Prefs', 'UI', 'DashboardV
         if (UI.isModalOpen() || ImportaView.isBusy()) pendingRefresh = true; else render();
       } else updateStatus();
     });
-    document.getElementById('modal').addEventListener('close', () => { if (pendingRefresh) { pendingRefresh = false; render(); } });
+    UI.onModalClosed(() => { if (pendingRefresh) { pendingRefresh = false; render(); } });
     setInterval(() => { Db.poll().then(updateStatus); }, Config.POLL_MS);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) Db.poll(); });
+    // Modalità memoria: chiudere la pagina con modifiche non scaricate le perderebbe.
+    window.addEventListener('beforeunload', (e) => { if (Db.state().mode === 'memoria' && Db.state().dirty) { e.preventDefault(); e.returnValue = ''; } });
     if (Db.state().mode === 'attesa') UI.toast('Clicca su "Ricollega" in alto per riaprire l\'archivio condiviso', 'warn', 10000);
     render();
   }

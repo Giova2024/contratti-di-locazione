@@ -11,7 +11,7 @@ Applicazione web **in un unico file** (`index.html`) per gestire i contratti di 
 - **import/export** JSON (completo) e CSV (contratti, scadenze, anagrafiche), copia del database `.sqlite`;
 - **registro errori** consultabile, filtrabile, copiabile e svuotabile, più un'autodiagnosi integrata (37 controlli).
 
-Versione corrente: **1.0.0** (indicata nel titolo della pagina e in Impostazioni → Informazioni).
+Versione corrente: **1.1.0** (indicata nel titolo della pagina e in Impostazioni → Informazioni).
 
 ---
 
@@ -22,7 +22,7 @@ Versione corrente: **1.0.0** (indicata nel titolo della pagina e in Impostazioni
 | Linguaggio | **JavaScript (ES2020)** | È l'unico linguaggio eseguito nativamente da tutti i browser richiesti: niente compilazione, niente installazione. |
 | Framework | **Nessuno (vanilla JS)** con un piccolo registro di moduli | Un framework come React o Vue richiederebbe una fase di build o un runtime pesante. Per 5 utenti e un solo file, i template con escape automatico e un registro di moduli con dipendenze esplicite bastano e restano leggibili. |
 | Database | **SQLite** tramite [sql.js](https://sql.js.org) 1.10.3 (SQLite compilato in WebAssembly) | Si usa un vero file `.sqlite`, apribile con qualsiasi strumento SQLite. Lo schema e le migrazioni sono applicati automaticamente all'avvio. |
-| Condivisione tra le 5 postazioni | File `.sqlite` su una **cartella condivisa del server locale**, letto e scritto con la File System Access API | Non serve un server applicativo: prima di ogni salvataggio l'app ricarica il file se un collega l'ha modificato, e controlla gli aggiornamenti ogni 15 secondi. |
+| Condivisione tra le 5 postazioni | File `contratti-locazione.sqlite` in una **cartella del server locale scelta dall'utente**, letto e scritto con la File System Access API | Non serve un server applicativo: prima di ogni salvataggio l'app ricarica il file se un collega l'ha modificato, controlla gli aggiornamenti ogni 15 secondi e ogni giorno salva una copia in `backup/` (ultime 30). |
 | Lettura documenti | pdf.js 3.11.174, mammoth 1.6.0, tesseract.js 5.1.0 (lingua `ita`) | Sono caricati dal CDN solo quando si importa. **I documenti non lasciano mai il PC**: dalla rete arrivano solo le librerie e il modello OCR. |
 
 ### Compatibilità dei browser
@@ -32,6 +32,7 @@ Versione corrente: **1.0.0** (indicata nel titolo della pagina e in Impostazioni
 | Consultazione, inserimento, scadenzario, import/export | ✅ | ✅ |
 | Import da cartella con OCR | ✅ (la cartella resta memorizzata) | ✅ (va riselezionata a ogni sessione) |
 | **Archivio condiviso sul server** (scrittura diretta del `.sqlite`) | ✅ | ❌ si lavora su una copia locale, da caricare e riscaricare a mano |
+| App **allegata al sito Giovannigor** (area applicativi) | apri/salva il file a mano (vedi sotto) | apri/salva il file a mano |
 
 > **Per l'uso in ufficio (5 postazioni) si usa Chrome o Edge.** Firefox e Safari non permettono a una pagina web di scrivere su un file del disco.
 
@@ -73,12 +74,26 @@ Al **primo avvio** l'app crea il database, applica le migrazioni e carica 5 cont
 
 ## Configurazione dell'archivio condiviso (una volta per ufficio)
 
-1. Sulla **prima postazione**, in Chrome o Edge: *Impostazioni → Elimina dati di esempio* (facoltativo), poi *Crea nuovo archivio condiviso con i dati attuali…*. Salva il file nella cartella del server, ad esempio `Z:\Contratti\contratti-locazione.sqlite`.
-2. Sulle **altre postazioni**: *Impostazioni → Apri archivio condiviso esistente…* e seleziona lo stesso file.
-3. Su ogni postazione indica il **nome dell'utente** (Impostazioni → Utente). Viene registrato su modifiche, rinnovi e adempimenti completati.
-4. A ogni riapertura del browser, Chrome potrebbe chiedere di riconfermare l'accesso al file. In quel caso, in alto compare **"Ricollega …"**: un clic e si riparte. Con Chrome 122 o successivo si può scegliere "Consenti sempre" per non doverlo più ripetere.
+1. Sulla **prima postazione**, in Chrome o Edge: *Impostazioni → Elimina dati di esempio* (facoltativo), poi **Scegli la cartella del server…** (il pulsante è anche nel Riepilogo) e seleziona la cartella condivisa, ad esempio `Z:\Contratti`. Il browser chiede di consentire la modifica dei file della cartella: conferma. L'app crea `contratti-locazione.sqlite` con i dati attuali.
+2. Sulle **altre postazioni**: **Scegli la cartella del server…** e seleziona la stessa cartella. L'app trova il file esistente e lo apre.
+3. Nella sottocartella `backup` l'app salva automaticamente, alla prima modifica di ogni giorno, una copia `contratti-locazione_AAAA-MM-GG.sqlite`, conservando le ultime 30. Per ripristinare un backup: *Import / Export → Carica da file .sqlite*.
+4. In alternativa si può collegare un singolo file con un nome diverso (*Impostazioni → Apri un file .sqlite specifico…*), ma in quel caso non vengono fatti i backup.
+5. Su ogni postazione indica il **nome dell'utente** (Impostazioni → Utente). Viene registrato su modifiche, rinnovi e adempimenti completati.
+6. A ogni riapertura del browser, Chrome potrebbe chiedere di riconfermare l'accesso alla cartella. In quel caso, in alto compare **"Ricollega …"**: un clic e si riparte. Con Chrome 122 o successivo si può scegliere "Consenti sempre" per non doverlo più ripetere.
 
-Lo stato dell'archivio è sempre visibile in alto a destra: verde = condiviso, giallo = copia locale, rosso = da ricollegare.
+Lo stato dell'archivio è sempre visibile in alto a destra: verde = condiviso, giallo = copia locale, rosso = da ricollegare (o, nel sito, modifiche da salvare).
+
+## Uso come applicativo del sito Giovannigor
+
+`index.html` si può allegare così com'è nell'area applicativi del sito: *Admin → Applicativi → carica file HTML* (è un file singolo da circa 230 KB, sotto il limite di 10 MB). Le librerie arrivano dal CDN, che la sandbox del sito consente.
+
+Il sito però esegue gli applicativi in un **iframe sandbox senza `allow-same-origin`**, una scelta di sicurezza per evitare che un'app legga la sessione degli utenti. In quella sandbox il browser **non permette di scrivere nelle cartelle del server** e non conserva dati (niente IndexedDB). L'app lo riconosce da sola e passa alla **modalità memoria**:
+
+1. *Apri archivio .sqlite…* e seleziona `contratti-locazione.sqlite` dalla cartella del server;
+2. lavora normalmente: in alto compare "modifiche da salvare";
+3. *Salva archivio*: il browser scarica il file, che va **rimesso nella cartella del server sostituendo il precedente**. Se chiudi la pagina con modifiche non salvate, il browser chiede conferma.
+
+In questa modalità i colleghi non vedono le modifiche finché il file non viene rimesso sul server, e due persone che lavorano insieme possono sovrascriversi. Per il lavoro quotidiano in 5 conviene quindi aprire l'app **fuori dal sito**, dove salva direttamente nella cartella e sincronizza da sola: dall'indirizzo Vercel oppure dal file `index.html` copiato sul server. Sul sito può restare come accesso di consultazione, oppure come link a quella versione.
 
 ## Importazione dei contratti da cartella
 
@@ -106,10 +121,11 @@ Ogni modulo è registrato con `Modules.define(nome, [dipendenze], factory)` e ri
 | `Config` | Versione, URL delle librerie, costanti |
 | `Log` | Registro errori persistente (localStorage) e intercettazione degli errori globali |
 | `Util` | Date ISO, numeri in formato italiano, CSV, SHA-256, download, appunti |
-| `Store` | Chiave/valore su IndexedDB: copia di lavoro del DB, handle di file e cartelle |
+| `Ambiente` | Riconosce sandbox (sito), disponibilità di file e cartelle |
+| `Store` | Chiave/valore su IndexedDB: copia di lavoro del DB, handle di file e cartelle (in memoria se IndexedDB manca) |
 | `Prefs` | Preferenze della singola postazione (utente, OCR, tema) |
 | `Migrations` | Schema versionato e migrazioni (tabella `schema_version`) |
-| `Db` | sql.js, query, transazioni serializzate, archivio locale/condiviso, sincronizzazione |
+| `Db` | sql.js, query, transazioni serializzate, archivio locale / cartella del server / memoria, backup giornalieri, sincronizzazione |
 | `Dominio` | Tipologie, regimi, categorie, calcolo delle scadenze, stima del registro, controlli di coerenza |
 | `Scadenzario` | Generazione e gestione delle scadenze, esportazione `.ics` |
 | `Repo` | Accesso ai dati di contratti, parti, immobili e documenti |
@@ -119,7 +135,7 @@ Ogni modulo è registrato con `Modules.define(nome, [dipendenze], factory)` e ri
 | `Parser` | Riconoscimento euristico dei campi, validazione di CF e P.IVA |
 | `FolderImport` | Selezione e scansione della cartella, coda di elaborazione |
 | `ImportExport` | JSON (sostituisci/unisci) e CSV |
-| `UI`, `ContrattoForm`, `ContrattoDettaglio`, `ScadenzeTable`, `ScadenzaForm` | Componenti di interfaccia |
+| `UI`, `Archivio`, `ContrattoForm`, `ContrattoDettaglio`, `ScadenzeTable`, `ScadenzaForm` | Componenti di interfaccia (`Archivio`: scelta cartella, ricollega, apri/salva file) |
 | `*View` | Le sezioni dell'app (Riepilogo, Contratti, Scadenzario, Importa, Import/Export, Impostazioni, Registro errori) |
 | `SelfTest` | Autodiagnosi (Registro errori → *Esegui autodiagnosi*) |
 | `App` | Avvio, navigazione, barra di stato, controllo periodico delle modifiche |
