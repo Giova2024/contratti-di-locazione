@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gestione Contratti di Locazione v1.1.0</title>
+<title>Gestione Contratti di Locazione v1.2.0</title>
 <meta name="description" content="Gestione contratti di locazione: archivio SQLite, import automatico da cartella con OCR, scadenzario e rinnovi.">
 <!-- sql.js: SQLite compilato in WebAssembly. Le altre librerie (pdf.js, mammoth, tesseract) sono caricate solo quando servono. -->
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
@@ -194,7 +194,7 @@ const Modules = (() => {
    --------------------------------------------------------------------- */
 Modules.define('Config', [], () => Object.freeze({
   APP_NAME: 'Gestione Contratti di Locazione',
-  APP_VERSION: '1.1.0',
+  APP_VERSION: '1.2.0',
   IDB_NAME: 'contratti-locazione',
   LOG_KEY: 'cl.registroErrori',
   LOG_MAX: 1000,
@@ -906,18 +906,51 @@ Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations', 'Ambiente'], (Conf
     await persist();
     notify('archivio');
   }
-  /** Modalità memoria: scarica l'archivio con lo stesso nome con cui è stato aperto. */
-  function saveDownload() {
-    const name = state.fileName || NOME_ARCHIVIO;
-    const blob = new Blob([exportBytes()], { type: 'application/x-sqlite3' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = name;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
-    state.dirty = false;
-    notify('salvato');
-    return name;
+  const TIPI_SQLITE = [{ description: 'Database SQLite', accept: { 'application/x-sqlite3': ['.sqlite', '.db', '.sqlite3'] } }];
+  /**
+   * Crea un nuovo archivio scegliendo cartella e nome del file ("Salva con nome") e vi copia i dati attuali.
+   * Senza la cartella non si possono fare i backup giornalieri: per quelli si usa pickFolder/useFolder.
+   */
+  async function createAt() {
+    const handle = await window.showSaveFilePicker({ id: 'archivio-contratti', suggestedName: NOME_ARCHIVIO, types: TIPI_SQLITE });
+    await ensurePermission(handle);
+    await writeChain;
+    Object.assign(state, { mode: 'condiviso', fileHandle: handle, dirHandle: null, fileName: handle.name, folderName: '', backupDay: null });
+    await writeToHandle();
+    await Store.set('db.bytes', exportBytes());
+    await memorizza();
+    Log.info('Db', 'Creato archivio ' + handle.name + ' nel percorso scelto');
+    notify('archivio');
+    return handle.name;
+  }
+  /**
+   * Salva una copia del database. Dove il browser lo consente apre "Salva con nome" (cartella e nome a scelta);
+   * altrimenti (sito in sandbox, Firefox, Safari) la scarica nella cartella Download.
+   * In modalità memoria la copia salvata azzera le "modifiche da salvare".
+   * @returns {Promise<{name:string, sceltoPercorso:boolean}>}
+   */
+  async function saveCopy({ suggestedName } = {}) {
+    const name = suggestedName || state.fileName || NOME_ARCHIVIO;
+    await writeChain;
+    const bytes = exportBytes();
+    let esito;
+    if (Ambiente.fileAccess && typeof window.showSaveFilePicker === 'function') {
+      const handle = await window.showSaveFilePicker({ id: 'copie-contratti', suggestedName: name, types: TIPI_SQLITE });
+      if (state.fileHandle && (await handle.isSameEntry(state.fileHandle))) throw new Error("Hai scelto il file dell'archivio in uso: per una copia scegli un altro nome o un'altra cartella");
+      const w = await handle.createWritable();
+      await w.write(bytes); await w.close();
+      esito = { name: handle.name, sceltoPercorso: true };
+    } else {
+      const url = URL.createObjectURL(new Blob([bytes], { type: 'application/x-sqlite3' }));
+      const a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      esito = { name, sceltoPercorso: false };
+    }
+    if (state.mode === 'memoria') { state.dirty = false; notify('salvato'); }
+    Log.info('Db', 'Copia dell\'archivio salvata: ' + esito.name);
+    return esito;
   }
   async function resetEmpty() {
     await writeChain;
@@ -928,7 +961,7 @@ Modules.define('Db', ['Config', 'Log', 'Store', 'Migrations', 'Ambiente'], (Conf
   }
 
   return {
-    start, all, one, run, write, poll, exportBytes, pickFolder, useFolder, connectShared, reconnect, disconnect, replaceWithBytes, saveDownload, resetEmpty,
+    start, all, one, run, write, poll, exportBytes, pickFolder, useFolder, connectShared, reconnect, disconnect, replaceWithBytes, createAt, saveCopy, resetEmpty,
     supportsFileAccess, supportsFolder, NOME_ARCHIVIO, state: () => ({ ...state }),
     onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     tableColumns: (table) => all(`PRAGMA table_info(${table})`).map(r => r.name)
@@ -3003,7 +3036,7 @@ Modules.define('DatiView', ['UI', 'ImportExport', 'Db', 'Util', 'Log'], (UI, Imp
       <div class="card">
         <h2 style="margin-top:0">Database SQLite</h2>
         <p class="muted">Copia binaria del database (apribile con DB Browser for SQLite). Caricare un file sostituisce i dati correnti.</p>
-        <div class="toolbar"><button class="btn" id="x-sqlite">Scarica copia .sqlite</button><button class="btn danger" id="i-sqlite">Carica da file .sqlite</button></div>
+        <div class="toolbar"><button class="btn" id="x-sqlite">${Db.supportsFileAccess() ? 'Salva copia .sqlite (scegli cartella e nome)…' : 'Scarica copia .sqlite'}</button><button class="btn danger" id="i-sqlite">Carica da file .sqlite</button></div>
       </div>`);
 
     el.querySelector('#x-json').addEventListener('click', () => UI.guard('DatiView', 'Esportazione JSON', async () => {
@@ -3033,7 +3066,10 @@ Modules.define('DatiView', ['UI', 'ImportExport', 'Db', 'Util', 'Log'], (UI, Imp
       el.querySelector('#csv-esito').innerHTML = UI.str(html`<div class="alert ${esito.errori.length ? 'warn' : 'ok'}">${esito.creati} contratti creati, ${esito.aggiornati} aggiornati.${esito.errori.length ? html`<ul>${esito.errori.map(e => html`<li>${e}</li>`)}</ul>` : ''}</div>`);
       UI.toast('Importazione CSV completata');
     }));
-    el.querySelector('#x-sqlite').addEventListener('click', () => Util.download(`contratti-locazione_${Util.todayISO()}.sqlite`, new Blob([Db.exportBytes()], { type: 'application/x-sqlite3' })));
+    el.querySelector('#x-sqlite').addEventListener('click', () => UI.guard('DatiView', 'Salvataggio copia', async () => {
+      const r = await Db.saveCopy({ suggestedName: `contratti-locazione_${Util.todayISO()}.sqlite` });
+      UI.toast(r.sceltoPercorso ? `Copia salvata: ${r.name}` : `Copia scaricata nella cartella Download: ${r.name}`);
+    }));
     el.querySelector('#i-sqlite').addEventListener('click', () => UI.guard('DatiView', 'Caricamento database', async () => {
       const f = await UI.pickFile('.sqlite,.db,.sqlite3');
       if (!f) return;
@@ -3077,7 +3113,7 @@ Modules.define('Archivio', ['UI', 'Db', 'Ambiente', 'Config'], (UI, Db, Ambiente
       return html`${completo ? html`<p class="muted">${spiegazione}</p>` : ''}
         <div class="toolbar" style="margin-bottom:0">
           <button class="btn primary" data-arch="apri-file">Apri archivio .sqlite…</button>
-          <button class="btn ${st.dirty ? 'primary' : ''}" data-arch="salva">Salva archivio (scarica ${st.fileName || Db.NOME_ARCHIVIO})</button>
+          <button class="btn ${st.dirty ? 'primary' : ''}" data-arch="salva">${Db.supportsFileAccess() ? 'Salva archivio (scegli cartella e nome)…' : `Salva archivio (scarica ${st.fileName || Db.NOME_ARCHIVIO})`}</button>
         </div>`;
     }
     if (!Db.supportsFolder()) {
@@ -3087,7 +3123,8 @@ Modules.define('Archivio', ['UI', 'Db', 'Ambiente', 'Config'], (UI, Db, Ambiente
       <div class="toolbar" style="margin-bottom:0">
         ${st.mode === 'attesa' ? html`<button class="btn primary" data-arch="ricollega">Ricollega ${st.folderName || st.fileName}</button>` : ''}
         <button class="btn ${st.mode === 'condiviso' || st.mode === 'attesa' ? '' : 'primary'}" data-arch="cartella">${st.mode === 'condiviso' ? "Cambia cartella dell'archivio…" : 'Scegli la cartella del server…'}</button>
-        ${completo ? html`<button class="btn" data-arch="file">Apri un file .sqlite specifico…</button>` : ''}
+        ${completo ? html`<button class="btn" data-arch="crea" title="Scegli cartella e nome del file; senza cartella collegata non si fanno i backup giornalieri">Crea archivio con nome e percorso a scelta…</button>
+          <button class="btn" data-arch="file">Apri un file .sqlite specifico…</button>` : ''}
         ${completo && st.mode !== 'locale' ? html`<button class="btn danger" data-arch="scollega">Scollega (lavora in locale)</button>` : ''}
       </div>`;
   }
@@ -3100,8 +3137,16 @@ Modules.define('Archivio', ['UI', 'Db', 'Ambiente', 'Config'], (UI, Db, Ambiente
       UI.toast('Archivio ' + f.name + ' aperto');
     },
     salva: async () => {
-      const n = Db.saveDownload();
-      UI.toast(`Archivio scaricato come ${n}: rimettilo nella cartella del server sostituendo il precedente`, 'ok', 9000);
+      const r = await Db.saveCopy();
+      UI.toast(r.sceltoPercorso
+        ? `Archivio salvato come ${r.name}`
+        : `Archivio scaricato come ${r.name} nella cartella Download: rimettilo nella cartella del server sostituendo il precedente`, 'ok', 9000);
+    },
+    crea: async () => {
+      const n = (Db.one('SELECT COUNT(*) AS n FROM contratti') || { n: 0 }).n;
+      if (!(await UI.confirmDialog(`Verrà creato un nuovo archivio con i dati attuali (${n} contratti): nella finestra successiva scegli la cartella e il nome del file.\nLe altre postazioni dovranno collegarlo con "Apri un file .sqlite specifico…". Con un nome scelto liberamente non vengono fatti i backup giornalieri: per averli usa "Scegli la cartella del server…".\n\nProcedere?`, { ok: 'Scegli percorso' }))) return;
+      const nome = await Db.createAt();
+      UI.toast('Archivio creato: ' + nome);
     },
     ricollega: async () => { await Db.reconnect(); UI.toast('Archivio ricollegato'); },
     cartella: async () => {

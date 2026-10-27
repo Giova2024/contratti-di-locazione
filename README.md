@@ -11,7 +11,7 @@ Applicazione web **in un unico file** (`index.html`) per gestire i contratti di 
 - **import/export** JSON (completo) e CSV (contratti, scadenze, anagrafiche), copia del database `.sqlite`;
 - **registro errori** consultabile, filtrabile, copiabile e svuotabile, più un'autodiagnosi integrata (37 controlli).
 
-Versione corrente: **1.1.0** (indicata nel titolo della pagina e in Impostazioni → Informazioni).
+Versione corrente: **1.2.0** (indicata nel titolo della pagina e in Impostazioni → Informazioni).
 
 ---
 
@@ -38,7 +38,7 @@ Versione corrente: **1.1.0** (indicata nel titolo della pagina e in Impostazioni
 
 ### Limiti noti, da conoscere
 
-- **Concorrenza**: SQLite viene caricato in memoria e il file viene riscritto intero a ogni salvataggio. Prima di scrivere l'app ricarica il file, quindi due colleghi che salvano a pochi secondi di distanza non si sovrascrivono. Due salvataggi nello stesso istante, invece, possono far vincere l'ultimo. Se un collega ha modificato lo stesso contratto mentre lo avevi aperto, l'app avvisa prima di sovrascrivere. Con 5 utenti il rischio è basso, ma conviene comunque fare un **backup periodico** (Import / Export → *Scarica copia .sqlite*, oppure il backup del server).
+- **Concorrenza**: SQLite viene caricato in memoria e il file viene riscritto intero a ogni salvataggio. Prima di scrivere l'app ricarica il file, quindi due colleghi che salvano a pochi secondi di distanza non si sovrascrivono. Due salvataggi nello stesso istante, invece, possono far vincere l'ultimo. Se un collega ha modificato lo stesso contratto mentre lo avevi aperto, l'app avvisa prima di sovrascrivere. Con 5 utenti il rischio è basso, ma conviene comunque fare un **backup periodico** (Import / Export → *Salva copia .sqlite*, oppure il backup del server).
 - **Riconoscimento automatico**: è euristico. Funziona bene sui contratti con struttura classica ("Il Sig. … C.F. … di seguito denominato locatore", "LOCATORE: …"). Ogni documento passa comunque dalla revisione manuale prima di diventare un contratto.
 - **OCR**: per default legge le prime 8 pagine di ogni PDF scansionato (valore modificabile). La prima volta scarica circa 15 MB tra motore e lingua italiana. Su PC poco potenti può richiedere 10–30 secondi a pagina.
 - **Calcoli fiscali**: l'imposta di registro è una **stima** (2%, 1% per gli strumentali dei soggetti IVA, 0,5% per i terreni agricoli, base al 70% per il canone concordato). Gli importi definitivi vanno verificati.
@@ -77,7 +77,7 @@ Al **primo avvio** l'app crea il database, applica le migrazioni e carica 5 cont
 1. Sulla **prima postazione**, in Chrome o Edge: *Impostazioni → Elimina dati di esempio* (facoltativo), poi **Scegli la cartella del server…** (il pulsante è anche nel Riepilogo) e seleziona la cartella condivisa, ad esempio `Z:\Contratti`. Il browser chiede di consentire la modifica dei file della cartella: conferma. L'app crea `contratti-locazione.sqlite` con i dati attuali.
 2. Sulle **altre postazioni**: **Scegli la cartella del server…** e seleziona la stessa cartella. L'app trova il file esistente e lo apre.
 3. Nella sottocartella `backup` l'app salva automaticamente, alla prima modifica di ogni giorno, una copia `contratti-locazione_AAAA-MM-GG.sqlite`, conservando le ultime 30. Per ripristinare un backup: *Import / Export → Carica da file .sqlite*.
-4. In alternativa si può collegare un singolo file con un nome diverso (*Impostazioni → Apri un file .sqlite specifico…*), ma in quel caso non vengono fatti i backup.
+4. In alternativa puoi scegliere liberamente **cartella e nome del file**: *Impostazioni → Crea archivio con nome e percorso a scelta…* apre la finestra "Salva con nome" e crea lì l'archivio con i dati attuali, per esempio `Z:\Studio\Archivio contratti.sqlite`. Le altre postazioni lo collegano con *Apri un file .sqlite specifico…*. In questo caso l'app conosce solo il file e non la cartella, quindi **non fa i backup giornalieri**.
 5. Su ogni postazione indica il **nome dell'utente** (Impostazioni → Utente). Viene registrato su modifiche, rinnovi e adempimenti completati.
 6. A ogni riapertura del browser, Chrome potrebbe chiedere di riconfermare l'accesso alla cartella. In quel caso, in alto compare **"Ricollega …"**: un clic e si riparte. Con Chrome 122 o successivo si può scegliere "Consenti sempre" per non doverlo più ripetere.
 
@@ -91,9 +91,13 @@ Il sito però esegue gli applicativi in un **iframe sandbox senza `allow-same-or
 
 1. *Apri archivio .sqlite…* e seleziona `contratti-locazione.sqlite` dalla cartella del server;
 2. lavora normalmente: in alto compare "modifiche da salvare";
-3. *Salva archivio*: il browser scarica il file, che va **rimesso nella cartella del server sostituendo il precedente**. Se chiudi la pagina con modifiche non salvate, il browser chiede conferma.
+3. *Salva archivio*: il browser scarica il file nella cartella Download (oppure chiede dove salvarlo, se in Chrome/Edge è attiva l'opzione "Chiedi dove salvare ciascun file"). Il file va **rimesso nella cartella del server sostituendo il precedente**. Se chiudi la pagina con modifiche non salvate, il browser chiede conferma.
 
 In questa modalità i colleghi non vedono le modifiche finché il file non viene rimesso sul server, e due persone che lavorano insieme possono sovrascriversi. Per il lavoro quotidiano in 5 conviene quindi aprire l'app **fuori dal sito**, dove salva direttamente nella cartella e sincronizza da sola: dall'indirizzo Vercel oppure dal file `index.html` copiato sul server. Sul sito può restare come accesso di consultazione, oppure come link a quella versione.
+
+### Copie dell'archivio
+
+*Import / Export → Salva copia .sqlite (scegli cartella e nome)…* apre la finestra "Salva con nome": scegli dove salvare la copia e con quale nome. Il nome proposto è `contratti-locazione_AAAA-MM-GG.sqlite`. Non si può sovrascrivere per errore il file dell'archivio in uso. Dove il browser non lo permette (sito in sandbox, Firefox, Safari) la copia viene scaricata nella cartella Download.
 
 ## Importazione dei contratti da cartella
 
