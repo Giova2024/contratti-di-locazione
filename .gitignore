@@ -1,0 +1,33 @@
+# Dati: i database e i contratti NON vanno mai nel repository (dati personali)
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.crswap
+contratti/
+esportazioni/
+*.json.bak
+backup*/
+
+# Esportazioni generate dall'app
+contratti-locazione_*.json
+contratti_*.csv
+scadenze_*.csv
+soggetti_*.csv
+scadenze_*.ics
+registro-errori_*.txt
+
+# Vercel
+.vercel/
+
+# Editor e sistema operativo
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node (se in futuro si aggiungono strumenti di sviluppo)
+node_modules/
+npm-debug.log*
